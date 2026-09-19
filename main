@@ -1,0 +1,263 @@
+import asyncio
+import os
+from dotenv import load_dotenv
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    ChatJoinRequest,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    CallbackQuery,
+    InputMediaPhoto
+)
+
+# Загружаем переменные из .env
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
+CHANNEL_LINK = os.getenv("CHANNEL_LINK")
+MOD_GROUP_ID = int(os.getenv("MOD_GROUP_ID"))
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+
+pending_requests = set()
+
+
+class VerificationSteps(StatesGroup):
+    step_like_comment = State()      # Шаг 1: 1 скриншот
+    step_tiktok_comments = State()   # Шаг 2: 10 скриншотов
+    step_tiktok_replies = State()    # Шаг 3: 5 скриншотов
+
+
+@dp.chat_join_request()
+async def handle_join_request(event: ChatJoinRequest):
+    if event.chat.id == CHANNEL_ID:
+        pending_requests.add(event.from_user.id)
+
+
+@dp.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Подать заявку в канал", url=CHANNEL_LINK)],
+        [InlineKeyboardButton(text="➡️ Продолжить", callback_data="check_subscription")]
+    ])
+
+    text = (
+        "Привет!\n\n"
+        "Чтобы получить доступ к каналу, нужно пройти несколько простых шагов:\n\n"
+        "1. Отправь заявку в канал по ссылке ниже.\n"
+        "2. Нажми «Продолжить» снизу для проверки."
+    )
+    await message.answer(text, reply_markup=keyboard)
+
+
+@dp.callback_query(F.data == "check_subscription")
+async def check_subscription(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    has_requested = False
+
+    if user_id in pending_requests:
+        has_requested = True
+    else:
+        try:
+            member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
+            if member.status in ("member", "administrator", "creator", "restricted"):
+                has_requested = True
+        except Exception:
+            pass
+
+    if not has_requested:
+        await callback.answer(
+            "Вы не отправили заявку! Сначала перейдите по ссылке и нажмите «Подать заявку».",
+            show_alert=True
+        )
+        return
+
+    await callback.message.delete_reply_markup()
+    await callback.message.answer("Заявка получена! ✅")
+
+    step1_text = (
+        "📌 **Шаг 1**\n\n"
+        "Поставь лайк на комментарий, с которого узнал о канале, и ответь на него текстом: `скинули`.\n\n"
+        "📸 Пришли **1 скриншот**, на котором видно выполненное задание."
+    )
+    await callback.message.answer(step1_text, parse_mode="Markdown")
+    await state.set_state(VerificationSteps.step_like_comment)
+
+
+@dp.message(VerificationSteps.step_like_comment, F.photo)
+async def process_step1(message: Message, state: FSMContext):
+    await state.update_data(step1_photo=message.photo[-1].file_id)
+
+    step2_text = (
+        "✅ Принято!\n\n"
+        "📌 **Шаг 2**\n"
+        "Оставь 10 комментариев под видео в TikTok и лайкни каждый свой комментарий, так же заскриншоть.\n\n"
+        "🔎 **Ищи в поиске:**\n"
+        "— «Сестра с братом»\n"
+        "— «Подьезд воронеж»\n\n"
+        "✍️ **Твой текст комментария:**\n"
+        "`@pup022 кому скинуть?`\n\n"
+        "📸 Пришли ровно **10 скриншотов** выполненного задания (можно одним альбомом сразу)."
+    )
+    await message.answer(step2_text, parse_mode="Markdown")
+    await state.set_state(VerificationSteps.step_tiktok_comments)
+    await state.update_data(step2_photos=[])
+
+
+@dp.message(VerificationSteps.step_tiktok_comments, F.photo)
+async def process_step2(message: Message, state: FSMContext):
+    data = await state.get_data()
+    photos = data.get("step2_photos", [])
+    photos.append(message.photo[-1].file_id)
+    await state.update_data(step2_photos=photos)
+
+    if len(photos) >= 10:
+        step3_text = (
+            "✅ Шаг 2 выполнен!\n\n"
+            "📌 **Шаг 3**\n"
+            "Найди 5 пустых комментариев под видео в TikTok:\n"
+            "▫️ «где найти?»\n"
+            "▫️ «где посмотреть»\n"
+            "▫️ «скиньте»\n\n"
+            "и ответь на каждый, лайкнув свой ответ, так же заскриншоть.\n\n"
+            "✍️ **Твой текст ответа:**\n"
+            "`@pup022 мне скинули тут)`\n\n"
+            "📸 Пришли ровно **5 скриншотов** выполненного задания (можно одним альбомом сразу)."
+        )
+        await message.answer(step3_text, parse_mode="Markdown")
+        await state.set_state(VerificationSteps.step_tiktok_replies)
+        await state.update_data(step3_photos=[])
+
+
+@dp.message(VerificationSteps.step_tiktok_replies, F.photo)
+async def process_step3(message: Message, state: FSMContext):
+    data = await state.get_data()
+    photos = data.get("step3_photos", [])
+    photos.append(message.photo[-1].file_id)
+    await state.update_data(step3_photos=photos)
+
+    if len(photos) >= 5:
+        await message.answer(
+            "🎉 Все задания успешно отправлены!\n"
+            "Твоя заявка находится на проверке у модератора. Ожидай одобрения."
+        )
+
+        user = message.from_user
+        username = f"@{user.username}" if user.username else "без username"
+
+        all_photos = []
+        if data.get("step1_photo"):
+            all_photos.append(data.get("step1_photo"))
+        all_photos.extend(data.get("step2_photos", [])[:10])
+        all_photos.extend(photos[:5])
+
+        batch1_items = all_photos[:10]
+        batch1 = [
+            InputMediaPhoto(
+                media=p,
+                caption=f"📸 Скриншоты от {user.full_name} ({username}) — Часть 1/2" if i == 0 else None
+            )
+            for i, p in enumerate(batch1_items)
+        ]
+        await bot.send_media_group(chat_id=MOD_GROUP_ID, media=batch1)
+
+        batch2_items = all_photos[10:]
+        if batch2_items:
+            batch2 = [
+                InputMediaPhoto(
+                    media=p,
+                    caption=f"📸 Скриншоты от {user.full_name} ({username}) — Часть 2/2" if i == 0 else None
+                )
+                for i, p in enumerate(batch2_items)
+            ]
+            await bot.send_media_group(chat_id=MOD_GROUP_ID, media=batch2)
+
+        card_text = (
+            f"📋 **Карточка заявки:**\n"
+            f"👤 Ник (Имя): **{user.full_name}**\n"
+            f"🔗 Юзернейм: **{username}**\n"
+            f"🆔 ID: `{user.id}`\n\n"
+            f"Все 16 скриншотов выше. Выберите решение:"
+        )
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Одобрить", callback_data=f"mod_ok:{user.id}"),
+                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"mod_no:{user.id}")
+            ]
+        ])
+
+        await bot.send_message(
+            chat_id=MOD_GROUP_ID,
+            text=card_text,
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+
+        await state.clear()
+
+
+@dp.callback_query(F.data.startswith("mod_ok:"))
+async def mod_approve(callback: CallbackQuery):
+    target_user_id = int(callback.data.split(":")[1])
+    moderator = callback.from_user
+    mod_tag = f"@{moderator.username}" if moderator.username else moderator.full_name
+
+    try:
+        await bot.send_message(
+            chat_id=target_user_id,
+            text="✅ Вы одобрены! Вы приняты в канал."
+        )
+    except Exception:
+        pass
+
+    await callback.message.edit_text(
+        f"✅ **Заявка ОДОБРЕНА**\n"
+        f"Модератор: {mod_tag}\n"
+        f"ID пользователя: `{target_user_id}`\n"
+        f"*(Примите заявку в канал вручную)*",
+        parse_mode="Markdown"
+    )
+    await callback.answer("Одобрено!")
+
+
+@dp.callback_query(F.data.startswith("mod_no:"))
+async def mod_reject(callback: CallbackQuery):
+    target_user_id = int(callback.data.split(":")[1])
+    moderator = callback.from_user
+    mod_tag = f"@{moderator.username}" if moderator.username else moderator.full_name
+
+    try:
+        await bot.send_message(
+            chat_id=target_user_id,
+            text="❌ Твоя заявка была отклонена модератором. Задания выполнены неверно или не хватает скриншотов."
+        )
+    except Exception:
+        pass
+
+    await callback.message.edit_text(
+        f"❌ **Заявка ОТКЛОНЕНА**\n"
+        f"Модератор: {mod_tag}\n"
+        f"ID пользователя: `{target_user_id}`",
+        parse_mode="Markdown"
+    )
+    await callback.answer("Отклонено!")
+
+
+async def main():
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
