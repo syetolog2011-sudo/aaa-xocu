@@ -1,5 +1,6 @@
 import asyncio
 import os
+import sqlite3
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F
@@ -27,6 +28,34 @@ MOD_GROUP_ID = int(os.getenv("MOD_GROUP_ID"))
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
+# ==================== БАЗА ДАННЫХ ====================
+DB_FILE = "users.db"
+
+def init_db():
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS approved_users (
+                user_id INTEGER PRIMARY KEY
+            )
+        """)
+        conn.commit()
+
+def is_user_approved(user_id: int) -> bool:
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM approved_users WHERE user_id = ?", (user_id,))
+        return cursor.fetchone() is not None
+
+def add_approved_user(user_id: int):
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR IGNORE INTO approved_users (user_id) VALUES (?)", (user_id,))
+        conn.commit()
+
+init_db()
+# =====================================================
+
 pending_requests = set()
 
 
@@ -44,6 +73,23 @@ async def handle_join_request(event: ChatJoinRequest):
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+
+    # 1. Проверяем в базе одобренных
+    if is_user_approved(user_id):
+        await message.answer("✅ Заявка в канал уже принята! Вы уже получили доступ.")
+        return
+
+    # 2. Дополнительная проверка на случай, если пользователь уже в канале
+    try:
+        member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
+        if member.status in ("member", "administrator", "creator"):
+            add_approved_user(user_id)
+            await message.answer("✅ Заявка в канал уже принята! Вы уже состоите в канале.")
+            return
+    except Exception:
+        pass
+
     await state.clear()
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -63,8 +109,13 @@ async def cmd_start(message: Message, state: FSMContext):
 @dp.callback_query(F.data == "check_subscription")
 async def check_subscription(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
-    has_requested = False
 
+    if is_user_approved(user_id):
+        await callback.answer("Заявка уже принята!", show_alert=True)
+        await callback.message.edit_text("✅ Заявка в канал уже принята!")
+        return
+
+    has_requested = False
     if user_id in pending_requests:
         has_requested = True
     else:
@@ -212,6 +263,9 @@ async def mod_approve(callback: CallbackQuery):
     target_user_id = int(callback.data.split(":")[1])
     moderator = callback.from_user
     mod_tag = f"@{moderator.username}" if moderator.username else moderator.full_name
+
+    # Сохраняем в базу данных, что заявка одобрена
+    add_approved_user(target_user_id)
 
     try:
         await bot.send_message(
